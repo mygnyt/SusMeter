@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SusMeter CS: оценка подозрительности аккаунта</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Source+Sans+3:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#E6ECF1;--panel:#F7FAFC;--ink:#12202B;--mute:#5B6B78;--line:#C5D0D9;--low:#1F8A70;--mid:#D9911A;--high:#C8402F}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0F171E;--panel:#18232C;--ink:#E6EEF4;--mute:#93A4B1;--line:#2B3A46;--low:#3FBF9F;--mid:#F0B24A;--high:#F0705F}}
+*{box-sizing:border-box}
+html{height:100%}
+body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);font:17px/1.55 "Source Sans 3",system-ui,sans-serif;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+main{max-width:720px;margin:0 auto;padding:40px 20px 64px}
+h1{font:800 clamp(38px,9vw,64px)/1 "Bricolage Grotesque",sans-serif;margin:0 0 12px;letter-spacing:-.02em}
+.lead{color:var(--mute);max-width:52ch;margin:0 0 28px}
+form{display:grid;gap:12px}
+input{width:100%;font:inherit;color:var(--ink);background:var(--panel);border:2px solid var(--line);border-radius:10px;padding:14px 16px}
+input:focus{outline:3px solid var(--mid);outline-offset:1px;border-color:transparent}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+details{color:var(--mute)}summary{cursor:pointer;margin-bottom:10px}
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+button{font:600 17px "Source Sans 3",sans-serif;border-radius:10px;padding:13px 22px;cursor:pointer;border:2px solid var(--ink);background:var(--ink);color:var(--bg)}
+button.ghost{background:transparent;color:var(--ink)}
+button:focus-visible{outline:3px solid var(--mid);outline-offset:2px}
+button[disabled]{opacity:.6;cursor:wait}
+#out{margin-top:36px}
+.err{color:var(--high);font-weight:600}
+.head{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.head img{width:56px;height:56px;border-radius:10px}
+.head b{font:800 22px "Bricolage Grotesque",sans-serif}
+.score{font:800 clamp(64px,16vw,104px)/1 "Bricolage Grotesque",sans-serif;letter-spacing:-.03em}
+.score small{font-size:.32em;color:var(--mute);font-weight:600}
+.verdict{font:600 20px "Source Sans 3";margin:4px 0 16px}
+.meter{position:relative;height:14px;border-radius:7px;background:linear-gradient(90deg,var(--low) 0 25%,var(--mid) 25% 55%,var(--high) 55%)}
+.meter i{position:absolute;top:-6px;width:4px;height:26px;background:var(--ink);border-radius:2px;transition:left .5s ease}
+.scale{display:flex;justify-content:space-between;color:var(--mute);font-size:14px;margin:6px 0 24px}
+.explain{background:var(--panel);border-left:5px solid var(--ink);padding:16px 18px;border-radius:0 10px 10px 0;white-space:pre-line}
+ul{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:8px}
+li{display:flex;gap:12px;align-items:baseline;background:var(--panel);border-radius:10px;padding:10px 14px}
+li b{min-width:44px;font-family:"Bricolage Grotesque",sans-serif}
+li.risk b{color:var(--high)}li.trust b{color:var(--low)}
+.note{color:var(--mute);font-size:15px;margin-top:22px}
+@media (prefers-reduced-motion:reduce){.meter i{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <h1>SusMeter CS</h1>
+  <p class="lead">Вставь ссылку на Steam-профиль, и мы оценим по открытым данным, насколько аккаунт подозрителен и почему. Это подсказка, а не приговор.</p>
+
+  <form id="f">
+    <input id="q" placeholder="https://steamcommunity.com/id/... или SteamID" autocomplete="off" required>
+    <details>
+      <summary>Добавить статистику вручную (из csstats или Leetify)</summary>
+      <div class="row">
+        <input id="hs" type="number" step="0.1" min="0" max="100" placeholder="HS %">
+        <input id="kd" type="number" step="0.01" min="0" placeholder="K/D">
+      </div>
+    </details>
+    <div class="btns">
+      <button id="go">Проверить аккаунт</button>
+      <button type="button" id="demo" class="ghost">Показать пример</button>
+    </div>
+  </form>
+
+  <section id="out" aria-live="polite"></section>
+  <p class="note">Оценка строится на косвенных признаках и может ошибаться: сильный игрок способен получить завышенный балл. Не используйте её для обвинений.</p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const LABEL = { low: "Низкий риск", medium: "Средний риск", high: "Высокий риск" };
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const DEMO = {
+  profile: { name: "Пример: новый аккаунт", avatar: "", url: "#" },
+  total: 60, level: "high",
+  factors: [
+    { kind: "risk", points: 15, label: "Аккаунту меньше месяца (18 дн.)" },
+    { kind: "risk", points: 20, label: "Мало часов (74), но K/D 2.1" },
+    { kind: "risk", points: 10, label: "Очень высокий HS%: 72%" },
+    { kind: "risk", points: 10, label: "У 3 из 40 друзей есть баны" },
+    { kind: "risk", points: 5, label: "Профиль закрыт, данных для оценки меньше" }
+  ],
+  explanation: "Оценка высокая в основном из-за сочетания признаков: аккаунт совсем свежий, при этом статистика необычно сильная для такого количества часов, и у части друзей есть баны. Ни один признак сам по себе ничего не доказывает. Хорошо то, что на аккаунте самом нет VAC-банов. Это оценка по косвенным данным, а не доказательство читерства."
+};
+
+function render(r) {
+  const p = r.profile;
+  $("out").innerHTML = `
+    <div class="head">${p.avatar ? `<img src="${esc(p.avatar)}" alt="">` : ""}<b>${esc(p.name)}</b></div>
+    <div class="score">${r.total}<small> / 100</small></div>
+    <div class="verdict" style="color:var(--${r.level === "medium" ? "mid" : r.level})">${LABEL[r.level]}</div>
+    <div class="meter"><i style="left:calc(${r.total}% - 2px)"></i></div>
+    <div class="scale"><span>0</span><span>25</span><span>55</span><span>100</span></div>
+    <div class="explain">${esc(r.explanation)}</div>
+    <ul>${r.factors.map((x) => `<li class="${x.kind}"><b>${x.points > 0 ? "+" : ""}${x.points}</b><span>${esc(x.label)}</span></li>`).join("") || "<li><span>Явных признаков риска не найдено.</span></li>"}</ul>`;
+}
+
+$("demo").onclick = () => render(DEMO);
+
+$("f").onsubmit = async (e) => {
+  e.preventDefault();
+  $("go").disabled = true; $("out").textContent = "Собираем данные…";
+  try {
+    const qs = new URLSearchParams({ q: $("q").value, hs: $("hs").value, kd: $("kd").value });
+    const res = await fetch("/.netlify/functions/check?" + qs);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Ошибка запроса");
+    render(data);
+  } catch (err) {
+    $("out").innerHTML = `<p class="err">${esc(err.message)}</p>`;
+  } finally { $("go").disabled = false; }
+};
+</script>
+</body>
+</html>
