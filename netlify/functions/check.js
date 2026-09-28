@@ -30,6 +30,36 @@ async function resolveId(q) {
   return r.response.success === 1 ? r.response.steamid : null;
 }
 
+async function faceit(steamId) {
+  const key = process.env.FACEIT_API_KEY;
+  if (!key) return null;
+  try {
+    const h = { Authorization: `Bearer ${key}` };
+    const base = "https://open.faceit.com/data/v4";
+    const r = await fetch(`${base}/players?game=cs2&game_player_id=${steamId}`, { headers: h });
+    if (!r.ok) return null;
+    const p = await r.json();
+    const [s, b] = await Promise.all([
+      fetch(`${base}/players/${p.player_id}/stats/cs2`, { headers: h }),
+      fetch(`${base}/players/${p.player_id}/bans`, { headers: h }),
+    ]);
+    const st = s.ok ? (await s.json()).lifetime || {} : {};
+    const bans = b.ok ? (await b.json()).items || [] : [];
+    return {
+      nickname: p.nickname,
+      level: p.games?.cs2?.skill_level ?? null,
+      elo: p.games?.cs2?.faceit_elo ?? null,
+      matches: Number(st["Matches"]) || 0,
+      hs: parseFloat(st["Average Headshots %"]) || 0,
+      kd: parseFloat(st["Average K/D Ratio"]) || 0,
+      winRate: parseFloat(st["Win Rate %"]) || 0,
+      bans: bans.length,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function score(d) {
   const f = []; // { kind: "risk" | "trust", points, label }
   const add = (kind, points, label) => f.push({ kind, points, label });
@@ -49,6 +79,21 @@ function score(d) {
   else if (d.hs >= 60) add("risk", 5, `Повышенный HS%: ${d.hs}%`);
   if (d.friendsChecked > 0 && d.friendsBanned >= 2) {
     add("risk", 10, `У ${d.friendsBanned} из ${d.friendsChecked} друзей есть баны`);
+  }
+  if (d.csHours >= 50 && d.recentHours / d.csHours > 0.7) {
+    add("risk", 5, `Почти все часы в КС наиграны за последние 2 недели (${d.recentHours} из ${d.csHours})`);
+  }
+  if (d.isPublic && d.gamesCount !== null && d.gamesCount <= 3) {
+    add("risk", 5, `В библиотеке почти нет игр (${d.gamesCount}), похоже на одноразовый аккаунт`);
+  }
+  if (d.isPublic && d.friendsCount === 0) add("risk", 5, "В списке друзей никого нет");
+  if (d.faceit) {
+    const fc = d.faceit;
+    if (fc.bans > 0) add("risk", 15, `На FACEIT есть баны (${fc.bans})`);
+    if (fc.matches >= 20 && fc.matches < 100 && fc.kd >= 1.5) {
+      add("risk", 15, `На FACEIT всего ${fc.matches} матчей, но K/D ${fc.kd}`);
+    }
+    if (fc.matches >= 300 && fc.bans === 0) add("trust", -5, `FACEIT: ${fc.matches} матчей без банов`);
   }
   if (d.level !== null && d.level >= 10) add("trust", -5, `Уровень Steam ${d.level}`);
   if (!d.isPublic) add("risk", 5, "Профиль закрыт, данных для оценки меньше");
@@ -101,7 +146,7 @@ exports.handler = async (event) => {
     const [sum, bans, games, lvl, friends] = await Promise.all([
       steam("ISteamUser/GetPlayerSummaries/v2/", { steamids: id }),
       steam("ISteamUser/GetPlayerBans/v1/", { steamids: id }),
-      steam("IPlayerService/GetOwnedGames/v1/", { steamid: id, include_played_free_games: 1, "appids_filter[0]": CS2 }).catch(() => null),
+      steam("IPlayerService/GetOwnedGames/v1/", { steamid: id, include_played_free_games: 1 }).catch(() => null),
       steam("IPlayerService/GetSteamLevel/v1/", { steamid: id }).catch(() => null),
       steam("ISteamUser/GetFriendList/v1/", { steamid: id, relationship: "friend" }).catch(() => null),
     ]);
@@ -119,7 +164,8 @@ exports.handler = async (event) => {
       friendsBanned = fb.players.filter((x) => x.VACBanned || x.NumberOfGameBans > 0).length;
     }
 
-    const csGame = games?.response?.games?.[0];
+    const csGame = games?.response?.games?.find((g) => g.appid === CS2);
+    const fc = await faceit(id);
     const d = {
       isPublic,
       bans: bans.players[0],
@@ -129,14 +175,33 @@ exports.handler = async (event) => {
       friendsChecked,
       friendsBanned,
       // ручной ввод из csstats/Leetify (необязательно)
-      hs: Number(p.hs) || 0,
-      kd: Number(p.kd) || 0,
+      hs: Number(p.hs) || fc?.hs || 0,
+      kd: Number(p.kd) || fc?.kd || 0,
+      recentHours: csGame ? Math.round((csGame.playtime_2weeks || 0) / 60) : 0,
+      gamesCount: games?.response?.game_count ?? null,
+      friendsCount: friends ? (friends.friendslist?.friends || []).length : null,
+      faceit: fc,
     };
 
     const result = score(d);
     const explanation = await explain(d, result);
 
+    const stats = [
+      ["Возраст аккаунта", d.ageDays !== null ? `${d.ageDays} дн.` : "скрыт"],
+      ["Часов в КС", d.csHours !== null ? d.csHours : "скрыто"],
+      ["За 2 недели", d.csHours !== null ? `${d.recentHours} ч` : "скрыто"],
+      ["Уровень Steam", d.level ?? "скрыт"],
+      ["Игр в библиотеке", d.gamesCount ?? "скрыто"],
+      ["Друзей", d.friendsCount ?? "скрыто"],
+      ["Друзей с банами", d.friendsChecked ? `${d.friendsBanned} из ${d.friendsChecked}` : "нет данных"],
+      ["Баны Steam", d.bans.VACBanned || d.bans.NumberOfGameBans ? "есть" : "нет"],
+    ];
+    if (fc) {
+      stats.push(["FACEIT уровень", fc.level ?? "нет"], ["FACEIT матчей", fc.matches], ["HS %", fc.hs], ["K/D", fc.kd], ["Винрейт", `${fc.winRate}%`]);
+    }
+
     return json(200, {
+      stats,
       profile: { name: player.personaname, avatar: player.avatarfull, url: player.profileurl },
       ...result,
       explanation,
